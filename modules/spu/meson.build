@@ -46,3 +46,10 @@ vlc_modules += {
         'dynamicoverlay/dynamicoverlay.c'
     )
 }
+
+# livetranslate - DISABLED (Python server version)
+# vlc_modules += {
+#     'name' : 'livetranslate',
+#     'sources' : files('livetranslate.c')
+# }
+

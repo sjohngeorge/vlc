@@ -28,3 +28,16 @@ libdynamicoverlay_plugin_la_SOURCES = \
 	spu/dynamicoverlay/dynamicoverlay_commands.c \
 	spu/dynamicoverlay/dynamicoverlay.c spu/dynamicoverlay/dynamicoverlay.h
 spu_LTLIBRARIES += libdynamicoverlay_plugin.la
+
+# Disabled: liblivetranslate_plugin_la_SOURCES = spu/livetranslate.c
+# Disabled: spu_LTLIBRARIES += liblivetranslate_plugin.la
+
+
+
+# Whisper plugin - using the shared library from whisper.cpp build directory
+liblivetranslate_whisper_plugin_la_SOURCES = spu/livetranslate_whisper.c
+liblivetranslate_whisper_plugin_la_CFLAGS = $(AM_CFLAGS) -I/home/sharathg/whisper.cpp/include -I/home/sharathg/whisper.cpp/ggml/include
+liblivetranslate_whisper_plugin_la_LIBADD = -L/home/sharathg/whisper.cpp/build/src -lwhisper
+liblivetranslate_whisper_plugin_la_LDFLAGS = $(AM_LDFLAGS) -pthread -Wl,-rpath,/home/sharathg/whisper.cpp/build/src
+spu_LTLIBRARIES += liblivetranslate_whisper_plugin.la
+

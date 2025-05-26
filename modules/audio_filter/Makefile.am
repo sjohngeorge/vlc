@@ -154,3 +154,8 @@ librnnoise_plugin_la_LDFLAGS = $(AM_LDFLAGS) -rpath '$(audio_filterdir)'
 
 audio_filter_LTLIBRARIES += $(LTLIBrnnoise)
 EXTRA_LTLIBRARIES += librnnoise_plugin.la
+
+# Whisper audio capture filter
+liblivetranslate_whisper_audio_plugin_la_SOURCES = audio_filter/livetranslate_whisper_audio.c
+liblivetranslate_whisper_audio_plugin_la_CFLAGS = $(AM_CFLAGS)
+audio_filter_LTLIBRARIES += liblivetranslate_whisper_audio_plugin.la
