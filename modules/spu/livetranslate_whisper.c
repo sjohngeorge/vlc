@@ -25,10 +25,17 @@
  * 2. Build it and install the library
  * 3. Download a model (e.g., base model)
  * 4. Link against libwhisper when building this plugin
+ * 5. For non-English translation: Install CTranslate2 and translation models
  */
 
 #include <whisper.h>
 #include "whisper_shared_vlc.h"
+#include "ctranslate2_wrapper.h"
+
+// CLI translation functions
+char *translate_cli(const char *text, const char *source_lang, 
+                    const char *target_lang, vlc_object_t *obj);
+bool translate_cli_is_available(void);
 
 /*****************************************************************************
  * Module descriptor
@@ -43,8 +50,14 @@ static subpicture_t *Filter( filter_t *, vlc_tick_t );
 #define LANGUAGE_TEXT N_("Language")  
 #define LANGUAGE_LONGTEXT N_("Language code for transcription (e.g., 'en', 'ja', 'auto' for auto-detect)")
 
-#define TRANSLATE_TEXT N_("Translate to English")
-#define TRANSLATE_LONGTEXT N_("Translate audio to English instead of transcribing in original language")
+#define TRANSLATE_TEXT N_("Enable translation")
+#define TRANSLATE_LONGTEXT N_("Enable translation mode instead of transcription only")
+
+#define TARGET_LANG_TEXT N_("Target language")
+#define TARGET_LANG_LONGTEXT N_("Target language code for translation (e.g., 'fr' for French, 'es' for Spanish, 'de' for German, 'zh' for Chinese, 'ja' for Japanese)")
+
+#define TRANSLATION_MODEL_TEXT N_("Translation model path")
+#define TRANSLATION_MODEL_LONGTEXT N_("Path to CTranslate2 translation model directory (e.g., /path/to/opus-mt-en-fr)")
 
 #define CFG_PREFIX "livetranslate-whisper-"
 
@@ -58,6 +71,8 @@ vlc_module_begin()
     add_string( CFG_PREFIX "model", "/home/sharathg/vlc/whisper-models/ggml-base.bin", WHISPER_MODEL_TEXT, WHISPER_MODEL_LONGTEXT )
     add_string( CFG_PREFIX "language", "auto", LANGUAGE_TEXT, LANGUAGE_LONGTEXT )
     add_bool( CFG_PREFIX "translate", true, TRANSLATE_TEXT, TRANSLATE_LONGTEXT )
+    add_string( CFG_PREFIX "target-lang", "en", TARGET_LANG_TEXT, TARGET_LANG_LONGTEXT )
+    add_string( CFG_PREFIX "translation-model", "", TRANSLATION_MODEL_TEXT, TRANSLATION_MODEL_LONGTEXT )
     add_integer( CFG_PREFIX "position", 8, "Position", "Subtitle position" )
     add_integer( CFG_PREFIX "size", 0, "Font size", "Font size in pixels" )
     add_rgb( CFG_PREFIX "color", 0xFFFFFF, "Color", "Text color" )
@@ -198,14 +213,20 @@ struct filter_sys_t
     char *model_path;
     char *language;
     bool b_translate;
+    char *target_language;
+    char *translation_model_path;
     int i_pos;
     int i_size;
     text_style_t *p_style;
+    
+    /* Translation context for CTranslate2 */
+    translation_ctx_t *translation_ctx;
     
     /* Processing thread */
     vlc_thread_t processing_thread;
     bool b_processing_active;
 };
+
 
 
 /*****************************************************************************
@@ -290,13 +311,53 @@ static void *ProcessingThread(void *data)
                     // Get the last segment's text
                     const char *text = whisper_full_get_segment_text(p_sys->whisper_ctx, n_segments - 1);
                     
-                    vlc_mutex_lock(&p_sys->text_mutex);
-                    strncpy(p_sys->current_text, text, sizeof(p_sys->current_text) - 1);
-                    p_sys->current_text[sizeof(p_sys->current_text) - 1] = '\0';
-                    p_sys->last_update = vlc_tick_now();
-                    vlc_mutex_unlock(&p_sys->text_mutex);
+                    // Check if we need to translate to another language
+                    char *final_text = NULL;
+                    if (p_sys->b_translate && p_sys->target_language && 
+                        strcmp(p_sys->target_language, "en") != 0) {
+                        
+                        // Try CTranslate2 first
+                        if (p_sys->translation_ctx) {
+                            final_text = ctranslate2_translate(p_sys->translation_ctx, text, 
+                                                              "en", p_sys->target_language,
+                                                              VLC_OBJECT(p_filter));
+                            if (final_text) {
+                                msg_Info(p_filter, "Translated from English to %s using CTranslate2: %s", 
+                                        p_sys->target_language, final_text);
+                            }
+                        }
+                        
+                        // If CTranslate2 failed or not available, try CLI translation
+                        if (!final_text && translate_cli_is_available()) {
+                            final_text = translate_cli(text, "en", p_sys->target_language,
+                                                      VLC_OBJECT(p_filter));
+                            if (final_text) {
+                                msg_Info(p_filter, "Translated from English to %s using CLI: %s", 
+                                        p_sys->target_language, final_text);
+                            }
+                        }
+                        
+                        // If all translation failed, use original text
+                        if (!final_text) {
+                            final_text = strdup(text);
+                            msg_Warn(p_filter, "Translation to %s failed, using English text", 
+                                    p_sys->target_language);
+                        }
+                    } else {
+                        // Use the text as-is (either original language or English)
+                        final_text = strdup(text);
+                    }
                     
-                    msg_Info(p_filter, "Whisper transcription: %s", text);
+                    if (final_text) {
+                        vlc_mutex_lock(&p_sys->text_mutex);
+                        strncpy(p_sys->current_text, final_text, sizeof(p_sys->current_text) - 1);
+                        p_sys->current_text[sizeof(p_sys->current_text) - 1] = '\0';
+                        p_sys->last_update = vlc_tick_now();
+                        vlc_mutex_unlock(&p_sys->text_mutex);
+                        
+                        msg_Info(p_filter, "Final text to display: %s", final_text);
+                        free(final_text);
+                    }
                 }
             } else {
                 msg_Err(p_filter, "Whisper processing failed");
@@ -332,6 +393,8 @@ static int CreateFilter( filter_t *p_filter )
     p_sys->model_path = var_InheritString(p_filter, CFG_PREFIX "model");
     p_sys->language = var_InheritString(p_filter, CFG_PREFIX "language");
     p_sys->b_translate = var_InheritBool(p_filter, CFG_PREFIX "translate");
+    p_sys->target_language = var_InheritString(p_filter, CFG_PREFIX "target-lang");
+    p_sys->translation_model_path = var_InheritString(p_filter, CFG_PREFIX "translation-model");
     p_sys->i_pos = var_InheritInteger(p_filter, CFG_PREFIX "position");
     p_sys->i_size = var_InheritInteger(p_filter, CFG_PREFIX "size");
     
@@ -357,6 +420,8 @@ static int CreateFilter( filter_t *p_filter )
         msg_Err(p_filter, "Failed to get shared audio buffer");
         text_style_Delete(p_sys->p_style);
         free(p_sys->language);
+        free(p_sys->target_language);
+        free(p_sys->translation_model_path);
         free(p_sys->model_path);
         // VLC mutexes don't need explicit destruction
         free(p_sys);
@@ -374,13 +439,44 @@ static int CreateFilter( filter_t *p_filter )
             msg_Err(p_filter, "Failed to load Whisper model from %s", p_sys->model_path);
         } else {
             msg_Info(p_filter, "Whisper model loaded successfully");
-            msg_Info(p_filter, "Translation mode: %s", p_sys->b_translate ? "enabled (to English)" : "disabled (transcribe only)");
+            if (p_sys->b_translate) {
+                msg_Info(p_filter, "Translation mode: enabled (target language: %s)", 
+                        p_sys->target_language ? p_sys->target_language : "en");
+            } else {
+                msg_Info(p_filter, "Translation mode: disabled (transcribe only)");
+            }
         }
         
         strcpy(p_sys->current_text, p_sys->b_translate ? "Whisper translator ready - waiting for audio..." : "Whisper transcriber ready - waiting for audio...");
     } else {
         msg_Warn(p_filter, "No Whisper model path specified");
         strcpy(p_sys->current_text, "Please configure Whisper model path");
+    }
+    
+    // Initialize CTranslate2 if translation model is specified
+    p_sys->translation_ctx = NULL;
+    if (p_sys->b_translate && p_sys->target_language && 
+        strcmp(p_sys->target_language, "en") != 0 &&
+        p_sys->translation_model_path && *p_sys->translation_model_path) {
+        
+        if (ctranslate2_is_available()) {
+            msg_Info(p_filter, "Initializing CTranslate2 with model: %s", 
+                    p_sys->translation_model_path);
+            p_sys->translation_ctx = ctranslate2_init(p_sys->translation_model_path, 
+                                                      VLC_OBJECT(p_filter));
+            if (!p_sys->translation_ctx) {
+                msg_Warn(p_filter, "Failed to initialize CTranslate2, will use English output only");
+            }
+        } else {
+            msg_Warn(p_filter, "CTranslate2 support not compiled in");
+            // Check if CLI translation is available as fallback
+            if (translate_cli_is_available()) {
+                msg_Info(p_filter, "translate-shell (CLI) is available as fallback");
+            } else {
+                msg_Warn(p_filter, "No translation backend available, will use English output only");
+                msg_Info(p_filter, "Install translate-shell for CLI translation: sudo apt-get install translate-shell");
+            }
+        }
     }
     
     // Start processing thread
@@ -418,12 +514,19 @@ static void DestroyFilter( filter_t *p_filter )
         whisper_free(p_sys->whisper_ctx);
     }
     
+    // Clean up CTranslate2
+    if (p_sys->translation_ctx) {
+        ctranslate2_cleanup(p_sys->translation_ctx);
+    }
+    
     // Release shared buffer
     whisper_shared_release_buffer(VLC_OBJECT(p_filter), p_sys->shared_buffer);
     
     // Free resources
     free(p_sys->model_path);
     free(p_sys->language);
+    free(p_sys->target_language);
+    free(p_sys->translation_model_path);
     text_style_Delete(p_sys->p_style);
     
     // Mutexes are automatically cleaned up
